@@ -1,55 +1,797 @@
-# Prerequisites
-*.d
+#include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "driver/dac_continuous.h"
 
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
+// =====================================================
+// FINAL ADAPTIVE SOFTWARE-DEFINED SONAR TRANSMITTER
+// ESP32 + DS18B20 + 10k POT + Internal DAC GPIO25
+// DMA / CYCLIC OUTPUT
+// AUTOMATIC ADAPTATION ONLY
+// =====================================================
 
-# Linker output
-*.ilk
-*.map
-*.exp
+// ---------------- PIN CONFIGURATION ----------------
+#define TEMP_PIN       4
+#define PRESSURE_PIN   34
+#define DAC_PIN        25
 
-# Precompiled Headers
-*.gch
-*.pch
+// ---------------- DAC CONFIGURATION ----------------
+#define SAMPLE_RATE    2000000       // 2 MS/s
+#define DMA_DESC_NUM   32
+#define DMA_BUF_SIZE   1024
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
+// Maximum buffer size
+#define MAX_SAMPLES    32000
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+// ---------------- SENSOR ----------------
+OneWire oneWire(TEMP_PIN);
+DallasTemperature sensors(&oneWire);
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+// ---------------- DAC ----------------
+dac_continuous_handle_t dacHandle = NULL;
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+// ---------------- ENVIRONMENT ----------------
+float temperatureC = 25.0;
+float pressureAtm = 1.0;
+int potValue = 0;
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+// ---------------- WAVEFORM TYPES ----------------
+enum WaveformType
+{
+  WAVE_LFM,
+  WAVE_PHASE,
+  WAVE_GEOMETRIC
+};
 
-# debug information files
-*.dwo
+WaveformType selectedWaveform = WAVE_LFM;
+WaveformType previousWaveform = WAVE_LFM;
+
+// ---------------- WAVEFORM BUFFER ----------------
+uint8_t waveformBuffer[MAX_SAMPLES];
+
+
+// =====================================================
+// READ ENVIRONMENT
+// =====================================================
+
+bool readEnvironment()
+{
+  sensors.requestTemperatures();
+
+  float newTemperature =
+      sensors.getTempCByIndex(0);
+
+  // Check DS18B20 validity
+  if (newTemperature == DEVICE_DISCONNECTED_C ||
+      newTemperature < -50.0 ||
+      newTemperature > 100.0)
+  {
+    Serial.println();
+    Serial.println("WARNING: INVALID TEMPERATURE READING");
+    Serial.println("Adaptive decision paused.");
+    return false;
+  }
+
+  temperatureC = newTemperature;
+
+  // Read potentiometer
+  potValue = analogRead(PRESSURE_PIN);
+
+  // POT:
+  // 0    -> 1 atm
+  // 4095 -> 15 atm
+
+  pressureAtm =
+      1.0 +
+      ((float)potValue / 4095.0) * 14.0;
+
+  return true;
+}
+
+
+// =====================================================
+// FINAL ADAPTIVE DECISION ENGINE
+// =====================================================
+
+void selectAdaptiveWaveform()
+{
+  /*
+     =================================================
+     REGION 1 - COLD / DEEP WATER
+     =================================================
+
+     Temperature : 4 - 20 C
+     Pressure    : > 10 atm
+
+     Selected waveform:
+     GEOMETRIC SWEEP
+
+     This condition is checked FIRST so that
+     deep-water pressure has priority.
+  */
+
+  if (temperatureC >= 4.0 &&
+      temperatureC <= 20.0 &&
+      pressureAtm > 10.0)
+  {
+    selectedWaveform = WAVE_GEOMETRIC;
+  }
+
+  /*
+     =================================================
+     REGION 2 - MODERATE DEPTH
+     =================================================
+
+     Temperature : 15 - 20 C
+     Pressure    : 4 - 10 atm
+
+     Selected waveform:
+     PHASE CODED
+  */
+
+  else if (temperatureC >= 15.0 &&
+           temperatureC <= 20.0 &&
+           pressureAtm >= 4.0 &&
+           pressureAtm <= 10.0)
+  {
+    selectedWaveform = WAVE_PHASE;
+  }
+
+  /*
+     =================================================
+     REGION 3 - WARM / SHALLOW WATER
+     =================================================
+
+     Temperature : 25 - 30 C
+     Pressure    : 1 - 3 atm
+
+     Selected waveform:
+     LFM CHIRP
+  */
+
+  else if (temperatureC >= 25.0 &&
+           temperatureC <= 30.0 &&
+           pressureAtm >= 1.0 &&
+           pressureAtm <= 3.0)
+  {
+    selectedWaveform = WAVE_LFM;
+  }
+
+  /*
+     =================================================
+     SAFE DEFAULT
+     =================================================
+
+     If the environment is outside the defined
+     demonstration regions, use LFM.
+  */
+
+  else
+  {
+    selectedWaveform = WAVE_LFM;
+  }
+}
+
+
+// =====================================================
+// STOP DAC
+// =====================================================
+
+void stopDAC()
+{
+  if (dacHandle != NULL)
+  {
+    dac_continuous_disable(dacHandle);
+
+    dac_continuous_del_channels(dacHandle);
+
+    dacHandle = NULL;
+  }
+}
+
+
+// =====================================================
+// START DAC DMA
+// =====================================================
+
+bool startDAC(uint8_t *buffer, size_t length)
+{
+  dac_continuous_config_t config = {};
+
+  config.chan_mask =
+      DAC_CHANNEL_MASK_CH0;       // GPIO25
+
+  config.desc_num =
+      DMA_DESC_NUM;
+
+  config.buf_size =
+      DMA_BUF_SIZE;
+
+  config.freq_hz =
+      SAMPLE_RATE;
+
+  config.offset = 0;
+
+  config.clk_src =
+      DAC_DIGI_CLK_SRC_DEFAULT;
+
+  esp_err_t result =
+      dac_continuous_new_channels(
+          &config,
+          &dacHandle);
+
+  if (result != ESP_OK)
+  {
+    Serial.print("DAC CREATE ERROR: ");
+    Serial.println(result);
+
+    dacHandle = NULL;
+
+    return false;
+  }
+
+  result =
+      dac_continuous_enable(dacHandle);
+
+  if (result != ESP_OK)
+  {
+    Serial.print("DAC ENABLE ERROR: ");
+    Serial.println(result);
+
+    stopDAC();
+
+    return false;
+  }
+
+  result =
+      dac_continuous_write_cyclically(
+          dacHandle,
+          buffer,
+          length,
+          NULL);
+
+  if (result != ESP_OK)
+  {
+    Serial.print("DAC WRITE ERROR: ");
+    Serial.println(result);
+
+    stopDAC();
+
+    return false;
+  }
+
+  return true;
+}
+
+
+// =====================================================
+// HANN WINDOW
+// =====================================================
+
+float hannWindow(uint32_t n, uint32_t N)
+{
+  if (N <= 1)
+    return 1.0;
+
+  return 0.5 *
+         (1.0 -
+          cosf(
+            2.0 * PI *
+            (float)n /
+            (float)(N - 1)
+          ));
+}
+
+
+// =====================================================
+// GENERATE LFM CHIRP
+//
+// 90 kHz -> 110 kHz
+// Bandwidth = 20 kHz
+// Pulse = 5 ms
+// Amplitude = 70 %
+// =====================================================
+
+size_t generateLFM()
+{
+  const float f0 = 90000.0;
+  const float f1 = 110000.0;
+
+  const float pulseTime = 0.005;
+
+  const float amplitude = 0.70;
+
+  const uint32_t pulseSamples =
+      (uint32_t)(
+        pulseTime *
+        SAMPLE_RATE
+      );
+
+  const uint32_t silenceSamples =
+      pulseSamples;
+
+  const uint32_t totalSamples =
+      pulseSamples +
+      silenceSamples;
+
+  float phase = 0.0;
+
+  for (uint32_t n = 0;
+       n < pulseSamples;
+       n++)
+  {
+    float t =
+        (float)n /
+        SAMPLE_RATE;
+
+    // Instantaneous frequency
+    float instantaneousFrequency =
+        f0 +
+        (f1 - f0) *
+        (t / pulseTime);
+
+    float phaseIncrement =
+        2.0 * PI *
+        instantaneousFrequency /
+        SAMPLE_RATE;
+
+    phase += phaseIncrement;
+
+    float window =
+        hannWindow(
+          n,
+          pulseSamples
+        );
+
+    float value =
+        128.0 +
+        127.0 *
+        amplitude *
+        window *
+        sinf(phase);
+
+    waveformBuffer[n] =
+        (uint8_t)
+        constrain(
+          value,
+          0.0,
+          255.0
+        );
+  }
+
+  // Silence after pulse
+  for (uint32_t n = pulseSamples;
+       n < totalSamples;
+       n++)
+  {
+    waveformBuffer[n] = 128;
+  }
+
+  return totalSamples;
+}
+
+
+// =====================================================
+// GENERATE PHASE CODED
+//
+// Carrier = 100 kHz
+// Code = 0 / 180 / 0 / 180
+// Chip = 2 ms
+// Pulse = 8 ms
+// Amplitude = 60 %
+// =====================================================
+
+size_t generatePhaseCoded()
+{
+  const float carrier = 100000.0;
+
+  const float amplitude = 0.60;
+
+  const uint32_t chipSamples =
+      (uint32_t)(
+        0.002 *
+        SAMPLE_RATE
+      );
+
+  const uint32_t pulseSamples =
+      chipSamples * 4;
+
+  const uint32_t silenceSamples =
+      pulseSamples;
+
+  const uint32_t totalSamples =
+      pulseSamples +
+      silenceSamples;
+
+  const int phaseCode[4] =
+  {
+    0,
+    180,
+    0,
+    180
+  };
+
+  for (uint32_t n = 0;
+       n < pulseSamples;
+       n++)
+  {
+    uint32_t chip =
+        n / chipSamples;
+
+    float phaseShift =
+        phaseCode[chip] *
+        PI /
+        180.0;
+
+    float t =
+        (float)n /
+        SAMPLE_RATE;
+
+    float phase =
+        2.0 *
+        PI *
+        carrier *
+        t +
+        phaseShift;
+
+    float window =
+        hannWindow(
+          n,
+          pulseSamples
+        );
+
+    float value =
+        128.0 +
+        127.0 *
+        amplitude *
+        window *
+        sinf(phase);
+
+    waveformBuffer[n] =
+        (uint8_t)
+        constrain(
+          value,
+          0.0,
+          255.0
+        );
+  }
+
+  // Silence
+  for (uint32_t n = pulseSamples;
+       n < totalSamples;
+       n++)
+  {
+    waveformBuffer[n] = 128;
+  }
+
+  return totalSamples;
+}
+
+
+// =====================================================
+// GENERATE GEOMETRIC SWEEP
+//
+// 50 kHz -> 80 kHz
+// Bandwidth = 30 kHz
+// Pulse = 10 ms
+// Amplitude = 80 %
+//
+// Exponential / logarithmic frequency sweep
+// =====================================================
+
+size_t generateGeometric()
+{
+  const float f0 = 50000.0;
+  const float f1 = 80000.0;
+
+  const float pulseTime = 0.010;
+
+  const float amplitude = 0.80;
+
+  const uint32_t pulseSamples =
+      (uint32_t)(
+        pulseTime *
+        SAMPLE_RATE
+      );
+
+  const uint32_t silenceSamples =
+      12000;
+
+  const uint32_t totalSamples =
+      pulseSamples +
+      silenceSamples;
+
+  const float logRatio =
+      logf(
+        f1 / f0
+      );
+
+  for (uint32_t n = 0;
+       n < pulseSamples;
+       n++)
+  {
+    float t =
+        (float)n /
+        SAMPLE_RATE;
+
+    /*
+       Integral of exponentially
+       changing instantaneous frequency
+    */
+
+    float phase =
+        2.0 *
+        PI *
+        (f0 *
+         pulseTime /
+         logRatio) *
+        (
+          expf(
+            logRatio *
+            t /
+            pulseTime
+          ) - 1.0
+        );
+
+    float window =
+        hannWindow(
+          n,
+          pulseSamples
+        );
+
+    float value =
+        128.0 +
+        127.0 *
+        amplitude *
+        window *
+        sinf(phase);
+
+    waveformBuffer[n] =
+        (uint8_t)
+        constrain(
+          value,
+          0.0,
+          255.0
+        );
+  }
+
+  // Silence
+  for (uint32_t n = pulseSamples;
+       n < totalSamples;
+       n++)
+  {
+    waveformBuffer[n] = 128;
+  }
+
+  return totalSamples;
+}
+
+
+// =====================================================
+// GENERATE + START SELECTED WAVEFORM
+// =====================================================
+
+void generateAndStartWaveform()
+{
+  stopDAC();
+
+  size_t waveformLength = 0;
+
+  Serial.println();
+
+  if (selectedWaveform == WAVE_LFM)
+  {
+    Serial.println("Generating LFM...");
+
+    waveformLength =
+        generateLFM();
+  }
+
+  else if (selectedWaveform == WAVE_PHASE)
+  {
+    Serial.println("Generating PHASE-CODED...");
+
+    waveformLength =
+        generatePhaseCoded();
+  }
+
+  else if (selectedWaveform == WAVE_GEOMETRIC)
+  {
+    Serial.println("Generating GEOMETRIC SWEEP...");
+
+    waveformLength =
+        generateGeometric();
+  }
+
+  Serial.print("BUFFER SAMPLES : ");
+  Serial.println(waveformLength);
+
+  if (!startDAC(
+        waveformBuffer,
+        waveformLength))
+  {
+    Serial.println("DAC START FAILED");
+    return;
+  }
+
+  Serial.println("DMA STARTED");
+}
+
+
+// =====================================================
+// PRINT CURRENT PARAMETERS
+// =====================================================
+
+void printParameters()
+{
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("       ADAPTIVE SONAR TRANSMITTER");
+  Serial.println("========================================");
+
+  Serial.print("Temperature : ");
+  Serial.print(
+    temperatureC,
+    2
+  );
+  Serial.println(" C");
+
+  Serial.print("POT ADC     : ");
+  Serial.println(potValue);
+
+  Serial.print("Pressure    : ");
+  Serial.print(
+    pressureAtm,
+    2
+  );
+  Serial.println(" atm");
+
+  Serial.println("----------------------------------------");
+
+  if (selectedWaveform == WAVE_LFM)
+  {
+    Serial.println("WAVEFORM    : LFM CHIRP");
+
+    Serial.println("START FREQ  : 90 kHz");
+
+    Serial.println("END FREQ    : 110 kHz");
+
+    Serial.println("BANDWIDTH   : 20 kHz");
+
+    Serial.println("PULSE       : 5 ms");
+
+    Serial.println("AMPLITUDE   : 70 %");
+  }
+
+  else if (selectedWaveform == WAVE_PHASE)
+  {
+    Serial.println("WAVEFORM    : PHASE CODED");
+
+    Serial.println("CARRIER     : 100 kHz");
+
+    Serial.println("PHASE CODE  : 0 / 180 / 0 / 180");
+
+    Serial.println("CHIP TIME   : 2 ms");
+
+    Serial.println("PULSE       : 8 ms");
+
+    Serial.println("AMPLITUDE   : 60 %");
+  }
+
+  else if (selectedWaveform == WAVE_GEOMETRIC)
+  {
+    Serial.println("WAVEFORM    : GEOMETRIC SWEEP");
+
+    Serial.println("START FREQ  : 50 kHz");
+
+    Serial.println("END FREQ    : 80 kHz");
+
+    Serial.println("BANDWIDTH   : 30 kHz");
+
+    Serial.println("PULSE       : 10 ms");
+
+    Serial.println("AMPLITUDE   : 80 %");
+  }
+
+  Serial.println("----------------------------------------");
+
+  Serial.println("ADAPTATION  : AUTOMATIC");
+
+  Serial.println("DAC         : GPIO25");
+
+  Serial.println("SAMPLE RATE : 2 MS/s");
+
+  Serial.println("DMA         : CYCLIC");
+
+  Serial.println("========================================");
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1000);
+
+  // 12-bit ADC
+  analogReadResolution(12);
+
+  // DS18B20
+  sensors.begin();
+
+  // Read initial environment
+  if (!readEnvironment())
+  {
+    temperatureC = 25.0;
+    pressureAtm = 1.0;
+    potValue = 0;
+  }
+
+  // Initial adaptive decision
+  selectAdaptiveWaveform();
+
+  // Generate initial waveform
+  generateAndStartWaveform();
+
+  previousWaveform =
+      selectedWaveform;
+
+  printParameters();
+
+  Serial.println();
+  Serial.println("SYSTEM READY");
+  Serial.println("ADAPTIVE MODE : AUTO");
+}
+
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop()
+{
+  // -----------------------------------------------
+  // Read temperature and pressure
+  // -----------------------------------------------
+
+  bool valid =
+      readEnvironment();
+
+  if (!valid)
+  {
+    delay(1000);
+    return;
+  }
+
+  // -----------------------------------------------
+  // Adaptive decision
+  // -----------------------------------------------
+
+  selectAdaptiveWaveform();
+
+  // -----------------------------------------------
+  // Change waveform only when the
+  // environmental region changes
+  // -----------------------------------------------
+
+  if (selectedWaveform !=
+      previousWaveform)
+  {
+    Serial.println();
+    Serial.println(">>> ENVIRONMENT CHANGED");
+    Serial.println(">>> ADAPTIVE WAVEFORM CHANGE");
+
+    generateAndStartWaveform();
+
+    previousWaveform =
+        selectedWaveform;
+
+    printParameters();
+  }
+
+  delay(1000);
+}
