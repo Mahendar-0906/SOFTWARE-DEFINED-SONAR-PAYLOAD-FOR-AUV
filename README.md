@@ -21,7 +21,7 @@ The objective is to develop a software-based sonar debriefing solution that redu
 
 ## Technologies
 
-- Python
+
 - Digital Signal Processing (DSP)
 - Machine Learning
 - Signal Processing
